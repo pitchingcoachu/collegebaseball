@@ -13,6 +13,8 @@ library(ggiraph)
 library(httr2)
 library(MASS)  # for kde2d in heatmaps
 library(digest)
+library(memoise)  # for caching expensive computations
+library(data.table)  # for faster data processing
 # --- media uploads (Cloudinary) ---
 # raise upload size if needed (50 MB here)
 options(shiny.maxRequestSize = 50 * 1024^2)
@@ -2177,6 +2179,12 @@ compute_stuff_simple <- function(df, base_type, level) {
     )
 }
 
+# Create memoized (cached) versions of expensive functions for performance
+compute_stuff_simple_cached <- memoise::memoise(compute_stuff_simple)
+make_summary_cached <- memoise::memoise(make_summary)
+compute_process_results_cached <- memoise::memoise(compute_process_results)
+compute_qp_points_cached <- memoise::memoise(compute_qp_points)
+
 
 # Strike zone constants
 ZONE_LEFT   <- -0.88
@@ -2813,7 +2821,8 @@ need_cols <- c(
   "PitchCall","KorBB","Balls","Strikes","SessionType",
   "ExitSpeed","Angle","BatterSide",
   "PlayResult","TaggedHitType","OutsOnPlay",
-  "Batter", "Catcher"   # ← add this
+  "Batter", "Catcher",  # Batter and Catcher
+  "PitcherTeam", "BatterTeam"  # Team columns for filtering
 )
 
 
@@ -2918,115 +2927,13 @@ catch_display <- ifelse(
 catcher_map <- setNames(raw_catchers, catch_display)
 
 
-# ==== PITCHERS-ONLY WHITELIST ====
-ALLOWED_PITCHERS <- c(
-  "Lee, Aidan",
-  "Limas, Jacob",
-  "Higginbottom, Elijah",
-  "Cunnings, Cam",
-  "Moeller, Luke",
-  "Smith, Jace",
-  "Frey, Chase",
-  "Ahern, Garrett",
-  "McGuire, Tommy",
-  "Robb, Nicholas",
-  "Guerrero, JT",
-  "Gregory, Billy",
-  "Penzkover, Gunnar",
-  "Lewis, JT",
-  "Kiemele, Cody",
-  "Cohen, Andrew",
-  "Lyon, Andrew",
-  "Johns, Tanner",
-  "Toney, Brock",
-  "Sloan, Landon",
-  "Key, Chance",
-  "Orr, Dillon"
-)
-
-# CAMPS SUITE - Allowed campers for camps module
-ALLOWED_CAMPERS <- c(
-  "Bowman, Brock",
-  "Daniels, Tyke",
-  "Pearson, Blake",
-  "Rodriguez, Josiah",
-  "James, Brody",
-  "Nevarez, Matthew",
-  "Nunes, Nolan",
-  "Parks, Jaeden",
-  "Hill, Grant",
-  "McGinnis, Ayden",
-  "Morton, Ryker",
-  "McGuire, John",
-  "Willson, Brandon",
-  "Lauterbach, Camden",
-  "Turnquist, Dylan",
-  "Bournonville, Tanner",
-  "Evans, Lincoln",
-  "Gnirk, Will",
-  "Mann, Tyson",
-  "Neneman, Chase",
-  "Warmus, Joaquin",
-  "Kapadia, Taylor",
-  "Stoner, Timothy",
-  "Bergloff, Cameron",
-  "Hamm, Jacob",
-  "Hofmeister, Ben",
-  "Moo, Eriksen",
-  "Peltz, Zayden",
-  "Huff, Tyler",
-  "Moseman, Cody"
-)
-
-
-`%in_ci%` <- function(x, y) tolower(x) %in% tolower(y)
-
-# NEW: normalize for case, spaces, punctuation (so "D.J." == "DJ")
-norm_name_ci <- function(x) gsub("[^a-z]", "", tolower(trimws(as.character(x))))
-
-# Keep the full dataset for Hitting & global refs
-# but build a PITCHING-ONLY copy that is filtered to the whitelist
-# (affects Pitching, Comparison, Leaderboard modules that use pitch_data_pitching)
-# If you ever want admins to bypass this, wrap the filter in `if (!is_admin()) { ... }`.
-pitch_data_pitching <- pitch_data %>%
-  dplyr::mutate(
-    Pitcher = as.character(Pitcher),
-    # Build a "First Last" display from "Last, First" for matching either style
-    .disp = ifelse(grepl(",", Pitcher),
-                   paste0(trimws(sub(".*,", "", Pitcher)), " ", trimws(sub(",.*", "", Pitcher))),
-                   Pitcher)
-  )
-
-# Accept either "Last, First" or "First Last" in ALLOWED_PITCHERS
-ALLOWED_PITCHERS_DL <- unique(c(
-  ALLOWED_PITCHERS,
-  ifelse(grepl(",", ALLOWED_PITCHERS),
-         paste0(trimws(sub(".*,", "", ALLOWED_PITCHERS)), " ", trimws(sub(",.*", "", ALLOWED_PITCHERS))),
-         ALLOWED_PITCHERS)
-))
-
-# Also include ALLOWED_CAMPERS in the pitching dataset
-ALLOWED_CAMPERS_DL <- unique(c(
-  ALLOWED_CAMPERS,
-  ifelse(grepl(",", ALLOWED_CAMPERS),
-         paste0(trimws(sub(".*,", "", ALLOWED_CAMPERS)), " ", trimws(sub(",.*", "", ALLOWED_CAMPERS))),
-         ALLOWED_CAMPERS)
-))
-
-# Combine both allowed lists for the pitching dataset
-ALL_ALLOWED_PITCHERS <- unique(c(ALLOWED_PITCHERS_DL, ALLOWED_CAMPERS_DL))
-
-# Robust, case/spacing/punctuation-insensitive filter
-allowed_norm <- norm_name_ci(ALL_ALLOWED_PITCHERS)
-pitch_data_pitching <- pitch_data_pitching %>%
-  dplyr::mutate(.norm_raw  = norm_name_ci(Pitcher),
-                .norm_disp = norm_name_ci(.disp)) %>%
-  dplyr::filter(.norm_raw %in% allowed_norm | .norm_disp %in% allowed_norm) %>%
-  dplyr::select(-.disp, -.norm_raw, -.norm_disp)
+# Keep the full dataset for both Hitting and Pitching
+# All players are now allowed - no whitelist filtering
+pitch_data_pitching <- pitch_data
 
 pitch_data_pitching <- ensure_pitch_keys(pitch_data_pitching)
 
-# Name map for Pitching UI (restricted to the filtered set)
+# Name map for Pitching UI (all pitchers in dataset)
 raw_names_p <- sort(unique(pitch_data_pitching$Pitcher))
 display_names_p <- ifelse(
   grepl(",", raw_names_p),
@@ -3631,11 +3538,7 @@ pitch_ui <- function(show_header = FALSE) {
           choices = c("All", "Bullpen", "Live"),
           selected = "All"
         ),
-        selectInput(
-          "teamType", "Team:",
-          choices = c("All" = "All", "GCU" = "GCU", "Campers" = "Campers"),
-          selected = "All"
-        ),
+        uiOutput("team_ui"),
         uiOutput("pitcher_ui"),
         dateRangeInput(
           "dates", "Date Range:",
@@ -11236,43 +11139,62 @@ server <- function(input, output, session) {
   })
   
   # 1) Pitcher selector
+  # Dynamic team dropdown based on PitcherTeam/BatterTeam columns
+  output$team_ui <- renderUI({
+    req(input$sessionType)
+    
+    # Determine which column to use based on current suite
+    suite <- current_suite()
+    
+    # For pitching/catching suites, use PitcherTeam
+    # For hitting suites, use BatterTeam
+    # Default to PitcherTeam for now (we'll refine when we know the suite)
+    team_col <- if (suite %in% c("Hitting", "Hitter Breakdown")) "BatterTeam" else "PitcherTeam"
+    
+    # Get unique teams from the appropriate column
+    df_base <- if (input$sessionType == "All") pitch_data else
+      dplyr::filter(pitch_data, SessionType == input$sessionType)
+    
+    teams <- if (team_col %in% names(df_base)) {
+      unique(na.omit(as.character(df_base[[team_col]])))
+    } else {
+      character(0)
+    }
+    
+    teams <- sort(teams[nzchar(teams)])
+    
+    # Create choices with "All" as default
+    team_choices <- c("All" = "All", setNames(teams, teams))
+    
+    selectInput(
+      "teamType", "Team:",
+      choices = team_choices,
+      selected = "All"
+    )
+  })
+  
   output$pitcher_ui <- renderUI({
-    req(input$sessionType, input$teamType)
+    req(input$sessionType)
+    
+    # Get team type if available, otherwise use "All"
+    team_type <- if (!is.null(input$teamType)) input$teamType else "All"
     
     df_base <- if (input$sessionType == "All") pitch_data_pitching else
       dplyr::filter(pitch_data_pitching, SessionType == input$sessionType)
     
-    # Apply team filtering
-    if (input$teamType == "Campers") {
-      df_base <- dplyr::filter(df_base, Pitcher %in% ALLOWED_CAMPERS)
-      # Create name map for campers
-      raw_names_team <- sort(unique(df_base$Pitcher))
-      display_names_team <- ifelse(
-        grepl(",", raw_names_team),
-        vapply(strsplit(raw_names_team, ",\\s*"), function(x) paste(x[2], x[1]), ""),
-        raw_names_team
-      )
-      name_map_team <- setNames(raw_names_team, display_names_team)
-    } else if (input$teamType == "GCU") {
-      # Filter to only GCU allowed pitchers (exclude campers)
-      df_base <- dplyr::filter(df_base, Pitcher %in% ALLOWED_PITCHERS)
-      raw_names_team <- sort(unique(df_base$Pitcher))
-      display_names_team <- ifelse(
-        grepl(",", raw_names_team),
-        vapply(strsplit(raw_names_team, ",\\s*"), function(x) paste(x[2], x[1]), ""),
-        raw_names_team
-      )
-      name_map_team <- setNames(raw_names_team, display_names_team)
-    } else {
-      # "All" - show all pitchers (both GCU and Campers)
-      raw_names_team <- sort(unique(df_base$Pitcher))
-      display_names_team <- ifelse(
-        grepl(",", raw_names_team),
-        vapply(strsplit(raw_names_team, ",\\s*"), function(x) paste(x[2], x[1]), ""),
-        raw_names_team
-      )
-      name_map_team <- setNames(raw_names_team, display_names_team)
+    # Apply team filtering if PitcherTeam column exists and team is selected
+    if (team_type != "All" && "PitcherTeam" %in% names(df_base)) {
+      df_base <- dplyr::filter(df_base, PitcherTeam == team_type)
     }
+    
+    # Create name map for available pitchers
+    raw_names_team <- sort(unique(df_base$Pitcher))
+    display_names_team <- ifelse(
+      grepl(",", raw_names_team),
+      vapply(strsplit(raw_names_team, ",\\s*"), function(x) paste(x[2], x[1]), ""),
+      raw_names_team
+    )
+    name_map_team <- setNames(raw_names_team, display_names_team)
     
     sel_raw <- unique(df_base$Pitcher[norm_email(df_base$Email) == norm_email(user_email())]) %>% na.omit()
     
@@ -11283,11 +11205,7 @@ server <- function(input, output, session) {
         selected = "All"
       )
     } else if (length(sel_raw) > 0) {
-      disp <- if (input$teamType == "Campers") {
-        display_names_team[raw_names_team %in% sel_raw]
-      } else {
-        display_names_p[raw_names_p %in% sel_raw]
-      }
+      disp <- display_names_team[raw_names_team %in% sel_raw]
       map2 <- setNames(sel_raw, disp)
       selectInput("pitcher", "Select Pitcher:", choices = map2, selected = sel_raw[1])
     } else {
@@ -11297,18 +11215,18 @@ server <- function(input, output, session) {
   
   
   observeEvent(list(input$sessionType, input$teamType), {
-    req(input$sessionType, input$teamType)
+    req(input$sessionType)
+    
+    # Get team type if available, otherwise use "All"
+    team_type <- if (!is.null(input$teamType)) input$teamType else "All"
     
     df_base <- if (input$sessionType == "All") pitch_data_pitching else
       dplyr::filter(pitch_data_pitching, SessionType == input$sessionType)
     
-    # Apply team filtering
-    if (input$teamType == "Campers") {
-      df_base <- dplyr::filter(df_base, Pitcher %in% ALLOWED_CAMPERS)
-    } else if (input$teamType == "GCU") {
-      df_base <- dplyr::filter(df_base, Pitcher %in% ALLOWED_PITCHERS)
+    # Apply team filtering if PitcherTeam column exists and team is selected
+    if (team_type != "All" && "PitcherTeam" %in% names(df_base)) {
+      df_base <- dplyr::filter(df_base, PitcherTeam == team_type)
     }
-    # If "All" is selected, don't filter - show all data
     
     last_date <- if (is.null(input$pitcher) || input$pitcher == "All") {
       max(df_base$Date, na.rm = TRUE)
@@ -11321,7 +11239,7 @@ server <- function(input, output, session) {
   
   # 2) Filtered data
   filtered_data <- reactive({
-    req(input$sessionType, input$hand, input$zoneLoc, input$inZone, input$qpLocations, input$teamType)
+    req(input$sessionType, input$hand, input$zoneLoc, input$inZone, input$qpLocations)
     
     is_valid_dates <- function(d) !is.null(d) && length(d) == 2 && all(is.finite(d))
     nnz <- function(x) !is.null(x) && !is.na(x)
@@ -11334,13 +11252,10 @@ server <- function(input, output, session) {
     df <- if (identical(input$sessionType, "All")) modified_pitch_data()
     else dplyr::filter(modified_pitch_data(), SessionType == input$sessionType)
     
-    # ⛔️ Team filtering - Filter by team selection ⛔️
-    if (!is.null(input$teamType)) {
-      if (input$teamType == "Campers") {
-        # Filter to only allowed campers
-        df <- dplyr::filter(df, Pitcher %in% ALLOWED_CAMPERS)
-      }
-      # If "GCU" is selected, use the existing data (already filtered to ALLOWED_PITCHERS)
+    # Team filtering - use PitcherTeam column if available
+    team_type <- if (!is.null(input$teamType)) input$teamType else "All"
+    if (team_type != "All" && "PitcherTeam" %in% names(df)) {
+      df <- dplyr::filter(df, PitcherTeam == team_type)
     }
     
     # ⛔️ Drop warmups & blank pitch types
