@@ -14,8 +14,8 @@ library(stringr)
 source("csv_filter_utils.R")
 # FTP credentials
 FTP_HOST <- "ftp.trackmanbaseball.com"
-FTP_USER <- "GrandCanyon"
-FTP_PASS <- "F42Y6LiLGS"
+FTP_USER <- "CalBaptist"
+FTP_PASS <- "5tz7saLl5Z"
 
 # Local data directories
 LOCAL_DATA_DIR      <- "data/"
